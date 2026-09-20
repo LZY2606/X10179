@@ -29,6 +29,86 @@ jsonpickle API
 
 .. autofunction:: jsonpickle.decode
 
+Restore Policies
+----------------
+
+``jsonpickle.decode`` accepts an opt-in ``restore_policy`` callable that is
+consulted for every jsonpickle-tagged node *before* jsonpickle constructs any
+object, imports any candidate class or invokes any registered handler.  This
+lets callers make finer-grained trust decisions than the global ``safe``
+switch.
+
+The policy receives a :class:`jsonpickle.policy.RestoreCandidate` containing
+metadata only:
+
+* ``path`` -- a stable JSON-pointer style path (``/items/0/name``), with
+  ``~`` and ``/`` escaped as ``~0`` and ``~1``;
+* ``tag`` -- the tag that triggered the consultation (e.g. ``py/object``,
+  ``py/reduce``, ``py/tuple``, ``py/id``);
+* ``module`` and ``cls_name`` -- the normalized module and fully qualified
+  candidate name, derived syntactically without importing;
+* ``handler`` -- the importable name of the registered handler that would
+  run, or ``None``;
+* ``parent_type`` -- the enclosing container (``dict``, ``list``,
+  ``set``, ``tuple``, the enclosing object's qualified name, or ``None`` at
+  the document root).
+
+It must return one of ``jsonpickle.policy.ALLOW``,
+``jsonpickle.policy.DENY`` or ``jsonpickle.policy.DEGRADE`` (bare strings are
+accepted), or a :class:`jsonpickle.policy.RestoreDecision` carrying a
+``rule`` and ``reason``.  A partially or fully constructed object is **never**
+passed to the callback.
+
+``ALLOW`` restores the node normally.  ``DENY`` aborts the decode with
+:class:`jsonpickle.policy.RestoreDeniedError`.  ``DEGRADE`` skips object
+construction and returns the node as a naive ``dict``/``list`` of primitive
+values; the jsonpickle tags remain ordinary string keys.  Nested tagged
+values are still passed through the policy, so degrading one node never
+exempts its subtree.  Reference machinery (``py/id``, forward references and
+cycles, ``make_refs=False`` payloads and the proxy sweep) stays self
+consistent in both the allow and degrade branches; e.g. a shared reference to
+a degraded object resolves to the same degraded value.
+
+.. code-block:: python
+
+    import jsonpickle
+    from jsonpickle.policy import ALLOW, DENY, DEGRADE, RulePolicy
+
+    policy = RulePolicy(
+        allow_modules=("myapp",),
+        deny_classes=("myapp.legacy.Danger",),
+        default=DENY,
+    )
+    obj = jsonpickle.decode(payload, restore_policy=policy)
+
+Decision trace
+~~~~~~~~~~~~~~
+
+Pass ``trace=my_list`` to collect one
+:class:`jsonpickle.policy.DecisionRecord` per consultation.  Each record
+stores the path, tag, candidate module/class, handler, parent type, action,
+rule and reason.
+
+**Privacy boundary:** the trace intentionally records structural metadata
+only -- jsonpickle never copies input payload values (attribute values,
+collection elements, base64 strings, etc.) into the trace.  Dict keys are
+part of the JSON path and therefore appear in trace records; do not store
+traces of inputs whose keys themselves are sensitive.
+
+Policies and traces are attached to a single decode.  When a policy callback
+raises, a handler fails mid-restore, or the JSON backend is switched,
+jsonpickle resets its internal reference table, proxy list and path stack so
+that no half-constructed object or placeholder leaks into the next decode.
+The sequence of policy decisions for a given input is identical across JSON
+backends.
+
+When no ``restore_policy`` is supplied, decoding (including ``loads`` and
+``safe=True`` semantics) behaves exactly as in previous releases.
+
+.. automodule:: jsonpickle.policy
+    :members:
+    :undoc-members:
+
 Choosing and Loading Backends
 -----------------------------
 

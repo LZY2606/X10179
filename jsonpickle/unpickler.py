@@ -5,11 +5,12 @@
 # This software is licensed as described in the file COPYING, which
 # you should have received as part of this distribution.
 import dataclasses
+import sys
 import warnings
 from collections.abc import Callable, Iterator, Sequence
-from typing import Any, TypeAlias
+from typing import Any, ClassVar, TypeAlias
 
-from . import errors, handlers, tags, util
+from . import errors, handlers, policy, tags, util
 from .backend import json
 
 # class names to class objects (or sequence of classes)
@@ -29,6 +30,8 @@ def decode(
     on_missing: MissingHandler = "ignore",
     handle_readonly: bool = False,
     handler_context: Any = None,
+    restore_policy: policy.RestorePolicy | None = None,
+    trace: policy.DecisionTrace | bool | None = None,
 ) -> Any:
     """Convert a JSON string into a Python object.
 
@@ -81,6 +84,18 @@ def decode(
         behavior at runtime based off data. Defaults to ``None``. An example can
         be found in the examples/ directory on GitHub.
 
+    :param restore_policy: Optional callback consulted *before* jsonpickle
+        constructs each tagged object. It receives a
+        :class:`jsonpickle.policy.RestoreCandidate` and must return
+        ``"allow"``, ``"deny"`` or ``"degrade"`` (or a
+        :class:`jsonpickle.policy.RestoreDecision`). Defaults to ``None``,
+        which preserves the historical behavior exactly.
+
+    :param trace: Optional list that receives one
+        :class:`jsonpickle.policy.DecisionRecord` per policy consultation.
+        Only structural metadata is ever recorded -- never values from the
+        input. Defaults to ``None``.
+
     >>> decode('"my string"') == 'my string'
     True
     >>> decode('36')
@@ -101,15 +116,21 @@ def decode(
         on_missing=on_missing,
         handle_readonly=handle_readonly,
         handler_context=handler_context,
+        restore_policy=restore_policy,
+        trace=trace,
     )
     if handler_context is not None:
         context.handler_context = handler_context
-    data = json.decode(string)
-    result = context.restore(data, reset=reset, classes=classes)
-    if is_ephemeral_context:
-        # Avoid holding onto references to external objects, which can
-        # prevent garbage collection from occuring.
-        context.reset()
+    try:
+        data = json.decode(string)
+        result = context.restore(data, reset=reset, classes=classes)
+    finally:
+        if is_ephemeral_context:
+            # Avoid holding onto references to external objects, which can
+            # prevent garbage collection from occuring. Do this even when the
+            # decode failed so that a policy/handler exception cannot leak a
+            # half-built object graph or a path stack into a later call.
+            context.reset()
     return result
 
 
@@ -324,6 +345,8 @@ class Unpickler:
         on_missing: MissingHandler = "ignore",
         handle_readonly: bool = False,
         handler_context: Any = None,
+        restore_policy: policy.RestorePolicy | None = None,
+        trace: policy.DecisionTrace | bool | None = None,
     ) -> None:
         self.backend = json
         self.keys = keys
@@ -332,6 +355,11 @@ class Unpickler:
         self.handle_readonly = handle_readonly
         # Custom context passed through to custom handlers, see #452
         self.handler_context = handler_context
+        # Opt-in restore policy. None means fully historical behavior.
+        self.restore_policy = restore_policy
+        # Structured decision trace. Lists metadata only, never values.
+        trace_value: Any = [] if trace is True else trace
+        self.trace: policy.DecisionTrace | None = trace_value
 
         self.reset()
 
@@ -351,6 +379,13 @@ class Unpickler:
         # Extra local classes not accessible globally
         self._classes = {}
 
+        # Policy-only bookkeeping. _parent_stack describes the enclosing
+        # container (JSON-side type or qualified object name) and _path_stack
+        # builds the stable JSON-pointer style path. Both stay empty when no
+        # policy is configured.
+        self._parent_stack: list[str] = []
+        self._path_stack: list[str] = []
+
     def _swap_proxies(self) -> None:
         """Replace proxies with their corresponding instances"""
         for obj, attr, proxy, method in self._proxies:
@@ -358,8 +393,17 @@ class Unpickler:
         self._proxies = []
 
     def _restore(
-        self, obj: Any, _passthrough: Callable[[Any], Any] = _passthrough
+        self,
+        obj: Any,
+        _passthrough: Callable[[Any], Any] = _passthrough,
+        _segment: Any = None,
     ) -> Any:
+        if self.restore_policy is not None and _segment is not None:
+            self._path_stack.append(self._escape_segment(_segment))
+            try:
+                return self._restore_gated(obj, _passthrough)
+            finally:
+                self._path_stack.pop()
         # if obj isn't in these types, neither it nor nothing in it can have a tag
         # don't change the tuple of types to a set, it won't work with isinstance
         if not isinstance(obj, (str, list, dict, set, tuple)):
@@ -367,6 +411,286 @@ class Unpickler:
         else:
             restore = self._restore_tags(obj)
         return restore(obj)
+
+    def _restore_gated(
+        self, obj: Any, _passthrough: Callable[[Any], Any] = _passthrough
+    ) -> Any:
+        """``_restore`` variant that consults the configured restore policy."""
+        if not isinstance(obj, (str, list, dict, set, tuple)):
+            return _passthrough(obj)
+        restore = self._restore_tags(obj)
+        tag = self._detect_tag(obj)
+        if tag is None:
+            # Plain dicts/lists are their own containers. They push parent
+            # frames from inside their restore functions and carry no
+            # additional path segment here (the current segment was pushed
+            # by the enclosing call).
+            return restore(obj)
+
+        tagged_obj = obj if isinstance(obj, dict) else {}
+        candidate = self._build_candidate(tagged_obj, tag)
+        action, _rule, reason = self._consult_policy(candidate)
+        if action == policy.DENY:
+            raise policy.RestoreDeniedError(candidate, reason)
+        if action == policy.DEGRADE:
+            return self._restore_naive(obj, tag, register=True)
+
+        # ALLOW: push a parent frame for container-like reconstructions so
+        # that nested values report a meaningful parent type.
+        frame = self._parent_frame(tagged_obj, tag)
+        if frame is not None:
+            self._parent_stack.append(frame)
+            try:
+                return restore(obj)
+            finally:
+                self._parent_stack.pop()
+        return restore(obj)
+
+    @staticmethod
+    def _escape_segment(segment: Any) -> str:
+        """Escape one path segment following JSON Pointer (RFC 6901)."""
+        text = str(segment)
+        return text.replace("~", "~0").replace("/", "~1")
+
+    def _refname_policy(self) -> str:
+        """Stable JSON-pointer style path of the current policy node."""
+        return "/" + "/".join(self._path_stack) if self._path_stack else "/"
+
+    # tag -> default (module, qualified name) used for structural tags
+    _STRUCTURAL_CANDIDATES: ClassVar[dict[str, tuple[str, str]]] = {
+        tags.TUPLE: ("builtins", "builtins.tuple"),
+        tags.SET: ("builtins", "builtins.set"),
+        tags.B64: ("builtins", "builtins.bytes"),
+        tags.B85: ("builtins", "builtins.bytes"),
+        tags.BYTEARRAY: ("builtins", "builtins.bytearray"),
+        tags.ITERATOR: ("builtins", "builtins.iterator"),
+    }
+
+    def _split_qualified_name(
+        self, name: str | None
+    ) -> tuple[str | None, str | None]:
+        """Split a dotted qualified name into (module, full name).
+
+        The split is purely syntactic, so this never imports anything.
+        """
+        if not name:
+            return None, None
+        parts = name.rsplit(".", 1)
+        if len(parts) == 1:
+            return None, name
+        return util.untranslate_module_name(parts[0]), name
+
+    def _peek_class_no_import(self, name: str) -> type | None:
+        """Resolve ``name`` without triggering any module import.
+
+        Only caller-supplied classes and already-imported modules are
+        consulted, so policy evaluation never executes import-time code.
+        """
+        if name in self._classes:
+            found: Any = self._classes[name]
+            return found if isinstance(found, type) else None
+        short = name.rsplit(".", 1)[-1]
+        if short in self._classes:
+            found = self._classes[short]
+            return found if isinstance(found, type) else None
+        module_name, attr_path = name, name
+        split = name.rsplit(".", 1)
+        if len(split) == 2:
+            module_name, attr_path = split
+        module = sys.modules.get(util.untranslate_module_name(module_name))
+        if module is None:
+            return None
+        result: Any = module
+        for attr in attr_path.split("."):
+            result = getattr(result, attr, None)
+            if result is None:
+                return None
+        return result if isinstance(result, type) else None
+
+    @staticmethod
+    def _peek_name(node: Any) -> str | None:
+        """Best-effort extraction of a qualified name from a tagged node."""
+        if isinstance(node, str):
+            return node
+        if isinstance(node, dict):
+            for tag_name in (
+                tags.OBJECT,
+                tags.TYPE,
+                tags.FUNCTION,
+                tags.MODULE,
+                tags.REPR,
+            ):
+                if tag_name in node:
+                    value = node[tag_name]
+                    if isinstance(value, str):
+                        if tag_name in (tags.MODULE, tags.REPR) and "/" in value:
+                            value = value.split("/", 1)[0]
+                        return value
+        return None
+
+    def _peek_reduce_name(self, obj: dict[str, Any]) -> str | None:
+        reduce_val = obj.get(tags.REDUCE)
+        if not isinstance(reduce_val, list) or not reduce_val:
+            return None
+        factory = reduce_val[0]
+        name = self._peek_name(factory)
+        if name is not None:
+            return name
+        if name is None and len(reduce_val) > 1 and isinstance(
+            reduce_val[1], list
+        ):
+            # tags.NEWOBJ form: [NEWOBJ, [cls, ...args]]
+            return self._peek_name(reduce_val[1][0])
+        return None
+
+    def _build_candidate(self, obj: dict[str, Any], tag: str) -> policy.RestoreCandidate:
+        module: str | None = None
+        cls_name: str | None = None
+        handler_name: str | None = None
+
+        structural = self._STRUCTURAL_CANDIDATES.get(tag)
+        if structural is not None:
+            module, cls_name = structural
+        elif tag == tags.OBJECT:
+            raw_name = obj.get(tags.OBJECT)
+            cls_name = raw_name if isinstance(raw_name, str) else None
+            module, cls_name = self._split_qualified_name(cls_name)
+            # Look up the registered handler by name without importing.
+            handler_cls = (
+                handlers.get(cls_name) if cls_name else None  # type: ignore[arg-type]
+            )
+            if handler_cls is None and isinstance(raw_name, str):
+                peeked = self._peek_class_no_import(raw_name)
+                if peeked is not None:
+                    handler_cls = handlers.get(peeked)
+            if handler_cls is not None:
+                try:
+                    handler_name = util.importable_name(handler_cls)
+                except (AttributeError, TypeError):
+                    handler_name = getattr(handler_cls, "__name__", None)
+        elif tag in (tags.TYPE, tags.FUNCTION):
+            module, cls_name = self._split_qualified_name(self._peek_name(obj))
+        elif tag == tags.MODULE:
+            value = obj.get(tags.MODULE)
+            if isinstance(value, str):
+                module = value.split("/", 1)[0]
+                cls_name = module
+        elif tag == tags.REPR:
+            value = obj.get(tags.REPR)
+            if isinstance(value, str):
+                module = value.split("/", 1)[0]
+                cls_name = module
+        elif tag == tags.REDUCE:
+            module, cls_name = self._split_qualified_name(
+                self._peek_reduce_name(obj)
+            )
+
+        return policy.RestoreCandidate(
+            path=self._refname_policy(),
+            tag=tag,
+            module=module,
+            cls_name=cls_name,
+            handler=handler_name,
+            parent_type=self._parent_stack[-1] if self._parent_stack else None,
+        )
+
+    def _consult_policy(
+        self, candidate: policy.RestoreCandidate
+    ) -> tuple[str, str, str]:
+        assert self.restore_policy is not None
+        result = self.restore_policy(candidate)
+        decision = policy._coerce_decision(result)
+        if self.trace is not None:
+            self.trace.append(
+                policy.DecisionRecord.from_decision(candidate, decision)
+            )
+        return decision.action, decision.rule, decision.reason
+
+    def _parent_frame(self, obj: dict[str, Any], tag: str) -> str | None:
+        """Parent type reported by children of an ALLOWed tagged node."""
+        if tag == tags.OBJECT:
+            name = obj.get(tags.OBJECT)
+            return name if isinstance(name, str) else "object"
+        if tag == tags.REDUCE:
+            name = self._peek_reduce_name(obj)
+            return name if name else "reduce"
+        if tag == tags.SET:
+            return "set"
+        if tag == tags.TUPLE:
+            return "tuple"
+        if tag == tags.ITERATOR:
+            return "list"
+        return None
+
+    def _restore_seq_values(self, values: Any) -> list[Any]:
+        """Restore a JSON array of values, tracking stable index paths."""
+        if self.restore_policy is None:
+            return [self._restore(v) for v in values]
+        return [
+            self._restore(v, _segment=index) for index, v in enumerate(values)
+        ]
+
+    # Tags that occupy an object slot and therefore need a placeholder
+    # registered *before* their children when degrading, so that py/id
+    # indices stay aligned with the encoded document.
+    _DEGRADE_REGISTER_TAGS: ClassVar[frozenset[str]] = frozenset(
+        {
+            tags.OBJECT,
+            tags.REDUCE,
+            tags.MODULE,
+            tags.REPR,
+        }
+    )
+
+    def _restore_naive(self, obj: Any, tag: str, register: bool) -> Any:
+        """Restore a degraded node as a primitive structure.
+
+        Nested tagged values are still sent through the policy, so degrading
+        one node never exempts the rest of its subtree.
+        """
+        if isinstance(obj, list):
+            return self._restore_naive_list(obj)
+        if not isinstance(obj, dict):
+            return obj
+        data: dict[str, Any] = {}
+        if register and tag in self._DEGRADE_REGISTER_TAGS:
+            self._mkref(data)
+        if self.restore_policy is not None:
+            # A degraded container behaves like a plain dict for its children.
+            self._parent_stack.append("dict")
+        try:
+            for k, v in util.items(obj):
+                segment = k.__str__() if isinstance(k, (int, float)) else k
+                if self.restore_policy is not None:
+                    # _restore pushes the segment and routes through the policy.
+                    data[k] = self._restore(v, _segment=segment)
+                else:
+                    data[k] = self._restore(v)
+                value = data[k]
+                if isinstance(value, _Proxy):
+                    self._proxies.append((data, k, value, _obj_setvalue))
+        finally:
+            if self.restore_policy is not None:
+                self._parent_stack.pop()
+        return data
+
+    def _restore_naive_list(self, obj: list[Any]) -> list[Any]:
+        if self.restore_policy is not None:
+            self._parent_stack.append("list")
+        parent: list[Any] = []
+        self._mkref(parent)
+        try:
+            children = self._restore_seq_values(obj)
+        finally:
+            if self.restore_policy is not None:
+                self._parent_stack.pop()
+        parent.extend(children)
+        self._proxies.extend(
+            (parent, idx, value, _obj_setvalue)
+            for idx, value in enumerate(parent)
+            if isinstance(value, _Proxy)
+        )
+        return parent
 
     def restore(
         self, obj: Any, reset: bool = True, classes: ClassesType | None = None
@@ -384,11 +708,23 @@ class Unpickler:
         """
         if reset:
             self.reset()
-        if classes:
-            self.register_classes(classes)
-        value = self._restore(obj)
-        if reset:
-            self._swap_proxies()
+        try:
+            if classes:
+                self.register_classes(classes)
+            if self.restore_policy is not None:
+                # The root node lives at path "/" and must also be gated.
+                value = self._restore_gated(obj)
+            else:
+                value = self._restore(obj)
+            if reset:
+                self._swap_proxies()
+        except BaseException:
+            # A failing top-level restore must never leave half-built
+            # objects, reference placeholders or path stacks behind for a
+            # subsequent decode to observe.
+            if reset:
+                self.reset()
+            raise
         return value
 
     def register_classes(self, classes: ClassesType) -> None:
@@ -427,10 +763,18 @@ class Unpickler:
 
     def _restore_bytearray(self, obj: dict[str, Any]) -> bytearray:
         payload = obj[tags.BYTEARRAY]
-        if tags.B85 in payload:
-            data = self._restore_base85(payload)
-        else:
-            data = self._restore_base64(payload)
+        if self.restore_policy is not None:
+            self._path_stack.append(
+                self._escape_segment(tags.BYTEARRAY)
+            )
+        try:
+            if tags.B85 in payload:
+                data = self._restore_base85(payload)
+            else:
+                data = self._restore_base64(payload)
+        finally:
+            if self.restore_policy is not None:
+                self._path_stack.pop()
         return bytearray(data)
 
     def _refname(self) -> str:
@@ -470,9 +814,15 @@ class Unpickler:
         return obj
 
     def _restore_list(self, obj: list[Any]) -> list[Any]:
+        if self.restore_policy is not None:
+            self._parent_stack.append("list")
         parent = []
         self._mkref(parent)
-        children = [self._restore(v) for v in obj]
+        try:
+            children = self._restore_seq_values(obj)
+        finally:
+            if self.restore_policy is not None:
+                self._parent_stack.pop()
         parent.extend(children)
         method = _obj_setvalue
         proxies = [
@@ -484,10 +834,16 @@ class Unpickler:
         return parent
 
     def _restore_iterator(self, obj: dict[str, Any]) -> Iterator[Any]:
+        if self.restore_policy is not None:
+            self._path_stack.append(self._escape_segment(tags.ITERATOR))
         try:
-            return iter(self._restore_list(obj[tags.ITERATOR]))
-        except TypeError:
-            return iter([])
+            try:
+                return iter(self._restore_list(obj[tags.ITERATOR]))
+            except TypeError:
+                return iter([])
+        finally:
+            if self.restore_policy is not None:
+                self._path_stack.pop()
 
     def _swapref(self, proxy: _Proxy, instance: Any) -> None:
         proxy_id = id(proxy)
@@ -509,7 +865,7 @@ class Unpickler:
         proxy = _Proxy()
         self._mkref(proxy)
         try:
-            reduce_val = list(map(self._restore, obj[tags.REDUCE]))
+            reduce_val = self._restore_seq_values(obj[tags.REDUCE])
         except TypeError:
             result = []
             proxy.reset(result)
@@ -676,6 +1032,11 @@ class Unpickler:
         method = _obj_setattr
         deferred = {}
 
+        use_policy = self.restore_policy is not None
+        if use_policy:
+            self._parent_stack.append(
+                util.importable_name(instance.__class__)
+            )
         for k, v in util.items(obj):
             # ignore the reserved attribute
             if ignorereserved and k in tags.RESERVED:
@@ -688,7 +1049,10 @@ class Unpickler:
             if restore_dict_items:
                 k = restore_key(k)
                 # step into the namespace
-                value = self._restore(v)
+                if use_policy:
+                    value = self._restore(v, _segment=str_k)
+                else:
+                    value = self._restore(v)
             else:
                 value = v
             if util._is_noncomplex(instance) or util._is_dictionary_subclass(instance):
@@ -738,6 +1102,9 @@ class Unpickler:
             # step out
             self._namestack.pop()
 
+        if use_policy:
+            self._parent_stack.pop()
+
         if deferred:
             # SQLAlchemy Immutable mappings must be constructed in one shot
             instance = instance.__class__(deferred)
@@ -745,7 +1112,13 @@ class Unpickler:
         return instance
 
     def _restore_state(self, obj: dict[str, Any], instance: Any) -> Any:
-        state = self._restore(obj[tags.STATE])
+        if self.restore_policy is not None:
+            self._path_stack.append(self._escape_segment(tags.STATE))
+        try:
+            state = self._restore(obj[tags.STATE])
+        finally:
+            if self.restore_policy is not None:
+                self._path_stack.pop()
         has_slots = (
             isinstance(state, tuple) and len(state) == 2 and isinstance(state[1], dict)
         )
@@ -785,11 +1158,11 @@ class Unpickler:
         # Handle list and set subclasses
         if has_tag(obj, tags.SEQ):
             if hasattr(instance, "append"):
-                for v in obj[tags.SEQ]:
-                    instance.append(self._restore(v))
+                for index, v in enumerate(obj[tags.SEQ]):
+                    instance.append(self._restore(v, _segment=index))
             elif hasattr(instance, "add"):
-                for v in obj[tags.SEQ]:
-                    instance.add(self._restore(v))
+                for index, v in enumerate(obj[tags.SEQ]):
+                    instance.add(self._restore(v, _segment=index))
 
         if has_tag(obj, tags.STATE):
             instance = self._restore_state(obj, instance)
@@ -808,15 +1181,41 @@ class Unpickler:
         # after the instance is available for referencing.
         factory = self._loadfactory(obj)
 
+        use_policy = self.restore_policy is not None
         if has_tag(obj, tags.NEWARGSEX):
-            args, kwargs = obj[tags.NEWARGSEX]
+            raw_args, raw_kwargs = obj[tags.NEWARGSEX]
+            if use_policy:
+                self._path_stack.append(
+                    self._escape_segment(tags.NEWARGSEX)
+                )
+                try:
+                    args = self._restore(raw_args, _segment=0) if raw_args else raw_args
+                    kwargs = (
+                        self._restore(raw_kwargs, _segment=1) if raw_kwargs else raw_kwargs
+                    )
+                finally:
+                    self._path_stack.pop()
+            else:
+                args = self._restore(raw_args) if raw_args else raw_args
+                kwargs = self._restore(raw_kwargs) if raw_kwargs else raw_kwargs
         else:
-            args = getargs(obj, classes=self._classes)
+            raw_args = getargs(obj, classes=self._classes)
+            args_tag = (
+                tags.NEWARGS
+                if has_tag(obj, tags.NEWARGS)
+                else tags.INITARGS
+                if has_tag(obj, tags.INITARGS)
+                else tags.SEQ
+            )
+            if raw_args:
+                args = (
+                    self._restore(raw_args, _segment=args_tag)
+                    if use_policy
+                    else self._restore(raw_args)
+                )
+            else:
+                args = raw_args
             kwargs = {}
-        if args:
-            args = self._restore(args)
-        if kwargs:
-            kwargs = self._restore(kwargs)
 
         is_oldstyle = not (isinstance(cls, type) or getattr(cls, "__meta__", None))
         try:
@@ -881,75 +1280,123 @@ class Unpickler:
 
     def _restore_set(self, obj: dict[str, Any]) -> set[Any]:
         try:
-            return {self._restore(v) for v in obj[tags.SET]}
+            return set(self._restore_seq_values(obj[tags.SET]))
         except TypeError:
             return set()
 
     def _restore_dict(self, obj: dict[str, Any]) -> dict[str, Any]:
+        use_policy = self.restore_policy is not None
+        if use_policy:
+            self._parent_stack.append("dict")
         data = {}
         self._mkref(data)
+        try:
+            # If we are decoding dicts that can have non-string keys then we
+            # need to do a two-phase decode where the non-string keys are
+            # processed last.  This ensures a deterministic order when
+            # assigning object IDs for references.
+            if self.keys:
+                # Phase 1: regular non-special keys.
+                for k, v in util.items(obj):
+                    if _is_json_key(k):
+                        continue
+                    if isinstance(k, (int, float)):
+                        str_k = k.__str__()
+                    else:
+                        str_k = k
+                    self._namestack.append(str_k)
+                    if use_policy:
+                        data[k] = result = self._restore(v, _segment=str_k)
+                    else:
+                        data[k] = result = self._restore(v)
+                    if isinstance(result, _Proxy):
+                        self._proxies.append((data, k, result, _obj_setvalue))
 
-        # If we are decoding dicts that can have non-string keys then we
-        # need to do a two-phase decode where the non-string keys are
-        # processed last.  This ensures a deterministic order when
-        # assigning object IDs for references.
-        if self.keys:
-            # Phase 1: regular non-special keys.
-            for k, v in util.items(obj):
-                if _is_json_key(k):
-                    continue
-                if isinstance(k, (int, float)):
-                    str_k = k.__str__()
-                else:
-                    str_k = k
-                self._namestack.append(str_k)
-                data[k] = result = self._restore(v)
-                if isinstance(result, _Proxy):
-                    self._proxies.append((data, k, result, _obj_setvalue))
+                    self._namestack.pop()
 
-                self._namestack.pop()
+                # Phase 2: object keys only.
+                for k, v in util.items(obj):
+                    if not _is_json_key(k):
+                        continue
+                    self._namestack.append(k)
 
-            # Phase 2: object keys only.
-            for k, v in util.items(obj):
-                if not _is_json_key(k):
-                    continue
-                self._namestack.append(k)
+                    restored_key = self._restore_pickled_key(k)
+                    if use_policy:
+                        result = self._restore(v, _segment=k)
+                    else:
+                        result = self._restore(v)
+                    try:
+                        data[restored_key] = result
+                    except TypeError:  # fail gracefully
+                        # The encoder can never emit an unhashable key, so if
+                        # this is triggered then we're dealing with hand-crafted
+                        # input. Keep the raw json:// key rather than failing the
+                        # whole decode
+                        data[k] = result
+                    else:
+                        k = restored_key
+                    # k is currently a proxy and must be replaced
+                    if isinstance(result, _Proxy):
+                        self._proxies.append((data, k, result, _obj_setvalue))
 
-                restored_key = self._restore_pickled_key(k)
-                result = self._restore(v)
-                try:
-                    data[restored_key] = result
-                except TypeError:  # fail gracefully
-                    # The encoder can never emit an unhashable key, so if this
-                    # is triggered then we're dealing with hand-crafted input.
-                    # Keep the raw json:// key rather than failing the whole decode
-                    data[k] = result
-                else:
-                    k = restored_key
-                # k is currently a proxy and must be replaced
-                if isinstance(result, _Proxy):
-                    self._proxies.append((data, k, result, _obj_setvalue))
-
-                self._namestack.pop()
-        else:
-            # No special keys, thus we don't need to restore the keys either.
-            for k, v in util.items(obj):
-                if isinstance(k, (int, float)):
-                    str_k = k.__str__()
-                else:
-                    str_k = k
-                self._namestack.append(str_k)
-                data[k] = result = self._restore(v)
-                if isinstance(result, _Proxy):
-                    self._proxies.append((data, k, result, _obj_setvalue))
-                self._namestack.pop()
+                    self._namestack.pop()
+            else:
+                # No special keys, thus we don't need to restore the keys either.
+                for k, v in util.items(obj):
+                    if isinstance(k, (int, float)):
+                        str_k = k.__str__()
+                    else:
+                        str_k = k
+                    self._namestack.append(str_k)
+                    if use_policy:
+                        data[k] = result = self._restore(v, _segment=str_k)
+                    else:
+                        data[k] = result = self._restore(v)
+                    if isinstance(result, _Proxy):
+                        self._proxies.append((data, k, result, _obj_setvalue))
+                    self._namestack.pop()
+        finally:
+            if use_policy:
+                self._parent_stack.pop()
         return data
 
     def _restore_tuple(self, obj: dict[str, Any]) -> tuple[Any, ...]:
         try:
-            return tuple(self._restore(v) for v in obj[tags.TUPLE])
+            return tuple(self._restore_seq_values(obj[tags.TUPLE]))
         except TypeError:
             return ()
+
+    # Ordered tag dispatch table, shared by _restore_tags and the policy
+    # machinery so that the two can never drift apart.
+    _TAG_DISPATCH: ClassVar[tuple[tuple[str, str], ...]] = (
+        (tags.TUPLE, "_restore_tuple"),
+        (tags.SET, "_restore_set"),
+        (tags.B64, "_restore_base64"),
+        (tags.B85, "_restore_base85"),
+        (tags.BYTEARRAY, "_restore_bytearray"),
+        (tags.ID, "_restore_id"),
+        (tags.ITERATOR, "_restore_iterator"),
+        (tags.OBJECT, "_restore_object"),
+        (tags.TYPE, "_restore_type"),
+        (tags.REDUCE, "_restore_reduce"),
+        (tags.FUNCTION, "_restore_function"),
+        (tags.MODULE, "_restore_module"),
+        (tags.REPR, "_restore_repr"),
+    )
+
+    def _detect_tag(self, obj: Any) -> str | None:
+        """Return the jsonpickle tag that governs restoration of ``obj``.
+
+        ``None`` means the node is restored as a plain dict/list/primitive.
+        """
+        if type(obj) is dict:
+            for tag, _method in self._TAG_DISPATCH:
+                if tag in obj:
+                    return tag
+            return None
+        if type(obj) is list:
+            return None
+        return None
 
     def _restore_tags(
         self, obj: Any, _passthrough: Callable[[Any], Any] = _passthrough
@@ -961,37 +1408,16 @@ class Unpickler:
         except TypeError:
             pass
         if type(obj) is dict:
-            if tags.TUPLE in obj:
-                restore = self._restore_tuple
-            elif tags.SET in obj:
-                restore = self._restore_set  # type: ignore[assignment]
-            elif tags.B64 in obj:
-                restore = self._restore_base64  # type: ignore[assignment]
-            elif tags.B85 in obj:
-                restore = self._restore_base85  # type: ignore[assignment]
-            elif tags.BYTEARRAY in obj:
-                restore = self._restore_bytearray  # type: ignore[assignment]
-            elif tags.ID in obj:
-                restore = self._restore_id
-            elif tags.ITERATOR in obj:
-                restore = self._restore_iterator  # type: ignore[assignment]
-            elif tags.OBJECT in obj:
-                restore = self._restore_object
-            elif tags.TYPE in obj:
-                restore = self._restore_type
-            elif tags.REDUCE in obj:
-                restore = self._restore_reduce
-            elif tags.FUNCTION in obj:
-                restore = self._restore_function
-            elif tags.MODULE in obj:
-                restore = self._restore_module
-            elif tags.REPR in obj:
-                if self.safe:
-                    restore = self._restore_repr_safe
+            restore = self._restore_dict
+            detected = self._detect_tag(obj)
+            if detected is not None:
+                if detected == tags.REPR:
+                    method_name = (
+                        "_restore_repr_safe" if self.safe else "_restore_repr"
+                    )
                 else:
-                    restore = self._restore_repr
-            else:
-                restore = self._restore_dict  # type: ignore[assignment]
+                    method_name = dict(self._TAG_DISPATCH)[detected]
+                restore = getattr(self, method_name)
         elif type(obj) is list:
             restore = self._restore_list  # type: ignore[assignment]
         else:

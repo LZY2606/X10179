@@ -94,6 +94,15 @@ from a security perspective.
    Safer deserialization approaches, such as reading JSON directly,
    may be more appropriate if you are processing untrusted data.
 
+For finer-grained control than the global ``safe`` switch,
+``jsonpickle.decode`` accepts an opt-in ``restore_policy`` callback.  The
+policy is consulted before any tagged object is constructed and may return
+``jsonpickle.policy.ALLOW``, ``jsonpickle.policy.DENY`` or
+``jsonpickle.policy.DEGRADE`` (restore as a naive dict/list instead).  Pass
+``trace=[]`` to collect a structured decision log.  See the
+`restore policy documentation <https://jsonpickle.readthedocs.io/en/latest/api.html#restore-policies>`_
+for the timing, degradation semantics and the trace privacy boundary.
+
 
 Install
 =======

@@ -1,3 +1,20 @@
+Unreleased
+==========
+    * Added an opt-in ``restore_policy`` callback to ``decode()``/``loads()``
+      and the low-level ``Unpickler``. The policy is consulted for every
+      jsonpickle-tagged node *before* object construction (or handler
+      invocation) and may return ``allow``, ``deny`` or ``degrade``; a
+      ``degrade`` decision restores the node as a naive dict/list while
+      nested values remain policy-checked. The callback receives normalized
+      module/class names, the triggering tag or registered handler, the
+      parent container type and a stable JSON-pointer path, but never a
+      constructed object. An optional ``trace`` list records structured
+      ``DecisionRecord`` metadata (never input payload values). References,
+      cycles, ``make_refs=False`` payloads and proxy resolution remain
+      consistent across allow and degrade branches, and failed decodes no
+      longer leak internal state into subsequent calls. Behavior is
+      unchanged when no policy is supplied.
+
 v5.0.0
 ======
     * **Breaking Change**: The ``yaml`` module is no longer registered by default.

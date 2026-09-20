@@ -67,9 +67,21 @@ added to JSON::
 """
 
 # Export other names not in __all__
+from . import policy  # noqa: F401
 from .backend import JSONBackend, json  # noqa: F401
 from .handlers import register, unregister  # noqa: F401
 from .pickler import Pickler, encode  # noqa: F401
+from .policy import (  # noqa: F401
+    ALLOW,
+    DEGRADE,
+    DENY,
+    DecisionRecord,
+    RestoreCandidate,
+    RestoreDecision,
+    RestoreDeniedError,
+    RestorePolicyError,
+    RulePolicy,
+)
 from .unpickler import Unpickler, decode  # noqa: F401
 from .version import __version__  # noqa: F401
 
