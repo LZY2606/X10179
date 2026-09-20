@@ -107,6 +107,17 @@ under your direct control.
     :members:
     :undoc-members:
 
+
+:mod:`jsonpickle.policy` -- Restore Policy
+------------------------------------------
+
+See :doc:`restore_policy` for an introduction to the opt-in restore
+policy and decision trace.
+
+.. automodule:: jsonpickle.policy
+    :members:
+    :undoc-members:
+
 Low Level API
 =============
 

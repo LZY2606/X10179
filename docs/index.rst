@@ -44,6 +44,13 @@ API Reference
 
    api
 
+Security
+========
+
+.. toctree::
+
+   restore_policy
+
 Extensions
 ==========
 

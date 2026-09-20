@@ -11,6 +11,19 @@ from typing import Any, TypeAlias
 
 from . import errors, handlers, tags, util
 from .backend import json
+from .policy import (
+    DEMOTE,
+    DENY,
+    DecisionRecord,
+    PolicyContext,
+    PolicyDecision,
+    RestoreCandidate,
+    RestoreDeniedError,
+    RestorePolicyCallbackError,
+    RestorePolicyError,
+    coerce_decision,
+    split_full_name,
+)
 
 # class names to class objects (or sequence of classes)
 ClassesType: TypeAlias = type | dict[str, type] | Sequence[type] | None
@@ -29,6 +42,8 @@ def decode(
     on_missing: MissingHandler = "ignore",
     handle_readonly: bool = False,
     handler_context: Any = None,
+    restore_policy: Any = None,
+    decision_trace: list[Any] | None = None,
 ) -> Any:
     """Convert a JSON string into a Python object.
 
@@ -81,6 +96,22 @@ def decode(
         behavior at runtime based off data. Defaults to ``None``. An example can
         be found in the examples/ directory on GitHub.
 
+    :param restore_policy: Optional callable invoked for every tagged JSON
+        node before it is instantiated.  It receives a
+        :class:`jsonpickle.policy.RestoreCandidate` and a
+        :class:`jsonpickle.policy.PolicyContext` and may return
+        :data:`jsonpickle.policy.ALLOW` (the default when ``None`` is
+        returned), :data:`jsonpickle.policy.DENY` or
+        :data:`jsonpickle.policy.DEMOTE`.  A demoted node is restored as a
+        naive JSON structure while its nested values are still checked by
+        the policy.  Defaults to ``None``, which preserves the historical
+        decoding behavior exactly.
+
+    :param decision_trace: Optional list that receives one
+        :class:`jsonpickle.policy.DecisionRecord` per tagged node.  The
+        trace records paths, candidate types, tags, results, rules and
+        reasons but never records values from the input document.
+
     >>> decode('"my string"') == 'my string'
     True
     >>> decode('36')
@@ -101,16 +132,20 @@ def decode(
         on_missing=on_missing,
         handle_readonly=handle_readonly,
         handler_context=handler_context,
+        restore_policy=restore_policy,
+        decision_trace=decision_trace,
     )
     if handler_context is not None:
         context.handler_context = handler_context
     data = json.decode(string)
-    result = context.restore(data, reset=reset, classes=classes)
-    if is_ephemeral_context:
-        # Avoid holding onto references to external objects, which can
-        # prevent garbage collection from occuring.
-        context.reset()
-    return result
+    try:
+        return context.restore(data, reset=reset, classes=classes)
+    finally:
+        if is_ephemeral_context:
+            # Avoid holding references to external objects (which can prevent
+            # garbage collection) and guarantee a failed decode never leaks
+            # half-built objects, proxies or the path stack into the next call.
+            context.reset()
 
 
 def _safe_hasattr(obj: Any, attr: str) -> bool:
@@ -324,6 +359,8 @@ class Unpickler:
         on_missing: MissingHandler = "ignore",
         handle_readonly: bool = False,
         handler_context: Any = None,
+        restore_policy: Any = None,
+        decision_trace: list[DecisionRecord] | None = None,
     ) -> None:
         self.backend = json
         self.keys = keys
@@ -332,6 +369,9 @@ class Unpickler:
         self.handle_readonly = handle_readonly
         # Custom context passed through to custom handlers, see #452
         self.handler_context = handler_context
+        # Opt-in per-node restore policy and its structured decision trace.
+        self.restore_policy = restore_policy
+        self.decision_trace = decision_trace
 
         self.reset()
 
@@ -351,11 +391,353 @@ class Unpickler:
         # Extra local classes not accessible globally
         self._classes = {}
 
+        # Stable, displayable JSON path of the current node, e.g. /a/0/b
+        self._path_stack: list[str] = []
+        # One descriptor per in-progress _restore() frame: the type name of
+        # the node being restored (the parent for its children), or None
+        # for the root.
+        self._parent_stack: list[str | None] = []
+
     def _swap_proxies(self) -> None:
         """Replace proxies with their corresponding instances"""
         for obj, attr, proxy, method in self._proxies:
             method(obj, attr, proxy)
         self._proxies = []
+
+    def _policy_enabled(self) -> bool:
+        return self.restore_policy is not None
+
+    @staticmethod
+    def _path_segment(key: Any) -> str:
+        """Render one JSON path segment without recording its value."""
+        if isinstance(key, str):
+            escaped = key.replace("~", "~0").replace("/", "~1")
+            return escaped
+        return str(key)
+
+    def _push_path(self, key: Any) -> None:
+        self._path_stack.append(self._path_segment(key))
+
+    def _pop_path(self) -> None:
+        self._path_stack.pop()
+
+    def _current_path(self) -> str:
+        return "/" + "/".join(self._path_stack)
+
+    def _current_parent(self) -> str | None:
+        if not self._parent_stack:
+            return None
+        return self._parent_stack[-1]
+
+    @staticmethod
+    def _detect_tag(obj: Any) -> str | None:
+        """Identify the tag that would dispatch ``obj``, if any."""
+        if type(obj) is list:
+            return None
+        if type(obj) is not dict:
+            return None
+        if tags.TUPLE in obj:
+            return tags.TUPLE
+        if tags.SET in obj:
+            return tags.SET
+        if tags.B64 in obj:
+            return tags.B64
+        if tags.B85 in obj:
+            return tags.B85
+        if tags.BYTEARRAY in obj:
+            return tags.BYTEARRAY
+        if tags.ID in obj:
+            return tags.ID
+        if tags.ITERATOR in obj:
+            return tags.ITERATOR
+        if tags.OBJECT in obj:
+            return tags.OBJECT
+        if tags.TYPE in obj:
+            return tags.TYPE
+        if tags.REDUCE in obj:
+            return tags.REDUCE
+        if tags.FUNCTION in obj:
+            return tags.FUNCTION
+        if tags.MODULE in obj:
+            return tags.MODULE
+        if tags.REPR in obj:
+            return tags.REPR
+        return None
+
+    def _build_candidate(self, obj: Any, tag: str) -> RestoreCandidate:
+        """Resolve module/class/handler metadata without constructing."""
+        module = None
+        qualified_name = None
+        full_name = None
+        resolved = False
+        cls = None
+        handler = None
+        payload = None
+
+        if tag == tags.OBJECT:
+            full_name = obj[tags.OBJECT]
+            cls = util.loadclass(full_name, classes=self._classes)
+            handler_cls = handlers.get(cls, handlers.get(full_name))  # type: ignore[arg-type]
+            handler = handler_cls
+            if cls is not None:
+                resolved = True
+                full_name = util.importable_name(cls)
+            module, qualified_name = split_full_name(full_name)
+            payload = full_name
+        elif tag in (tags.TYPE, tags.FUNCTION):
+            full_name = obj[tag]
+            cls = util.loadclass(full_name, classes=self._classes)
+            if cls is not None:
+                resolved = True
+                full_name = util.importable_name(cls)
+            module, qualified_name = split_full_name(full_name)
+            payload = full_name
+        elif tag == tags.MODULE:
+            spec = obj[tags.MODULE]
+            payload = spec
+            module = spec.split("/", 1)[0]
+            loaded = _loadmodule(spec)
+            if loaded is not None:
+                resolved = True
+                cls = loaded
+                module = getattr(loaded, "__name__", module)
+        elif tag == tags.REPR:
+            spec = obj[tags.REPR]
+            payload = spec
+            module_part, _, identifier = spec.partition("/")
+            module = module_part
+            qualified_name = identifier or None
+            loaded = _loadmodule(spec)
+            if loaded is not None:
+                resolved = True
+                cls = loaded
+                full_name = util.importable_name(loaded)
+                module, qualified_name = split_full_name(full_name)
+        elif tag == tags.REDUCE:
+            reduce_data = obj.get(tags.REDUCE)
+            if (
+                isinstance(reduce_data, list)
+                and reduce_data
+                and isinstance(reduce_data[0], str)
+            ):
+                payload = reduce_data[0]
+                module, qualified_name = split_full_name(reduce_data[0])
+                full_name = reduce_data[0]
+
+        return RestoreCandidate(
+            tag=tag,
+            module=module,
+            qualified_name=qualified_name,
+            full_name=full_name,
+            resolved=resolved,
+            cls=cls,
+            handler=handler,
+            payload=payload,
+        )
+
+    def _trace(
+        self,
+        candidate: RestoreCandidate | None,
+        tag: str | None,
+        result: str,
+        rule: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        if self.decision_trace is None:
+            return
+        if candidate is not None:
+            module = candidate.module
+            qualified_name = candidate.qualified_name
+        else:
+            module = qualified_name = None
+        self.decision_trace.append(
+            DecisionRecord(
+                path=self._current_path(),
+                tag=tag or "",
+                module=module,
+                qualified_name=qualified_name,
+                parent_type=self._current_parent(),
+                result=result,
+                rule=rule,
+                reason=reason,
+            )
+        )
+
+    def _invoke_policy(
+        self, obj: Any, tag: str
+    ) -> tuple[PolicyDecision, RestoreCandidate]:
+        candidate = self._build_candidate(obj, tag)
+        context = PolicyContext(
+            path=self._current_path(),
+            parent_type=self._current_parent(),
+        )
+        try:
+            raw_decision = self.restore_policy(candidate, context)
+        except RestorePolicyError:
+            raise
+        except Exception as error:
+            self._trace(
+                candidate,
+                tag,
+                "error",
+                reason=type(error).__name__,
+            )
+            raise RestorePolicyCallbackError(
+                f"restore policy callback raised {type(error).__name__}: {error}",
+                path=context.path,
+                tag=tag,
+                module=candidate.module,
+                qualified_name=candidate.qualified_name,
+            ) from error
+        try:
+            decision = coerce_decision(raw_decision)
+        except RestorePolicyError:
+            self._trace(candidate, tag, "error", reason="InvalidDecision")
+            raise
+        self._trace(candidate, tag, decision.result, decision.rule, decision.reason)
+        return decision, candidate
+
+    @staticmethod
+    def _container_descriptor(tag: str, candidate: RestoreCandidate) -> str | None:
+        """Descriptor of the node, used as parent_type for its children."""
+        if tag == tags.OBJECT:
+            if candidate.handler is not None:
+                return util.importable_name(candidate.handler)
+            if candidate.resolved and candidate.cls is not None:
+                return util.importable_name(candidate.cls)
+            return candidate.full_name
+        if tag == tags.REDUCE:
+            return candidate.full_name or "py/reduce"
+        if tag in (tags.TYPE, tags.FUNCTION):
+            return candidate.full_name
+        if tag == tags.MODULE:
+            return candidate.module
+        if tag == tags.REPR:
+            return candidate.full_name or candidate.qualified_name
+        if tag == tags.ITERATOR:
+            return "iterator"
+        if tag == tags.TUPLE:
+            return "builtins.tuple"
+        if tag == tags.SET:
+            return "builtins.set"
+        if tag == tags.BYTEARRAY:
+            return "builtins.bytearray"
+        # bytes payloads, ids and other leaf tags do not hold children
+        return None
+
+    def _restore_demoted(self, obj: Any, tag: str) -> Any:
+        """Restore a denied-tag node as a naive JSON structure.
+
+        All nested values still flow through ``_restore()`` and therefore
+        through the policy.
+        """
+        if tag == tags.TUPLE or tag == tags.SET or tag == tags.ITERATOR:
+            # Plain list.  Iterator payloads are mkref'd during normal
+            # decoding but tuple/set payloads are not, so mirror that to
+            # keep py/id indices aligned with the allowed branches.
+            parent: list[Any] = []
+            if tag == tags.ITERATOR:
+                self._mkref(parent)
+            payload = obj.get(tag, [])
+            children = []
+            for index, value in enumerate(payload):
+                self._push_path(index)
+                try:
+                    children.append(self._restore(value))
+                finally:
+                    self._pop_path()
+            parent.extend(children)
+            if tag == tags.ITERATOR:
+                return iter(parent)
+            return parent
+
+        if type(obj) is dict:
+            data: dict[Any, Any] = {}
+            # Only nodes that occupy a reference slot in the normal decoder
+            # (objects, py/reduce proxies, py/module and py/repr results)
+            # register the naive container so that py/id indices align.
+            if tag in (tags.OBJECT, tags.REDUCE, tags.MODULE, tags.REPR):
+                self._mkref(data)
+            for key, value in util.items(obj):
+                str_key = str(key)
+                self._push_path(str_key)
+                try:
+                    restored_key = key
+                    if _is_json_key(key):
+                        restored_key = self._restore_pickled_key(key)
+                    restored = self._restore(value)
+                finally:
+                    self._pop_path()
+                try:
+                    data[restored_key] = restored
+                except TypeError:
+                    data[str_key] = restored
+            return data
+
+        if type(obj) is list:
+            demoted_list: list[Any] = []
+            self._mkref(demoted_list)
+            for index, value in enumerate(obj):
+                self._push_path(index)
+                try:
+                    demoted_list.append(self._restore(value))
+                finally:
+                    self._pop_path()
+            return demoted_list
+
+        return obj
+
+    def _restore_with_policy(self, obj: Any, restore: Callable[[Any], Any]) -> Any:
+        """Policy-aware replacement for ``restore(obj)`` dispatch."""
+        tag = self._detect_tag(obj)
+        if tag is None:
+            if type(obj) is list:
+                descriptor = "builtins.list"
+            elif type(obj) is dict:
+                descriptor = "builtins.dict"
+            else:
+                descriptor = None
+            self._parent_stack.append(descriptor)
+            try:
+                return restore(obj)
+            finally:
+                self._parent_stack.pop()
+
+        decision, candidate = self._invoke_policy(obj, tag)
+        if decision.result == DENY:
+            raise RestoreDeniedError(
+                f"restore policy denied {tag} at {self._current_path()}",
+                path=self._current_path(),
+                tag=tag,
+                module=candidate.module,
+                qualified_name=candidate.qualified_name,
+                result=DENY,
+                rule=decision.rule,
+                reason=decision.reason,
+            )
+        if decision.result == DEMOTE and tag != tags.ID:
+            # Demoting a reference node still resolves the reference:
+            # py/id carries no constructible object of its own, and shared
+            # references must remain self-consistent under demotion.
+            descriptor = (
+                "builtins.list"
+                if type(obj) is list
+                else "builtins.dict"
+                if type(obj) is dict
+                else None
+            )
+            self._parent_stack.append(descriptor)
+            try:
+                return self._restore_demoted(obj, tag)
+            finally:
+                self._parent_stack.pop()
+
+        descriptor = self._container_descriptor(tag, candidate)
+        self._parent_stack.append(descriptor)
+        try:
+            return restore(obj)
+        finally:
+            self._parent_stack.pop()
 
     def _restore(
         self, obj: Any, _passthrough: Callable[[Any], Any] = _passthrough
@@ -366,7 +748,9 @@ class Unpickler:
             restore = _passthrough
         else:
             restore = self._restore_tags(obj)
-        return restore(obj)
+        if self.restore_policy is None or restore is _passthrough:
+            return restore(obj)
+        return self._restore_with_policy(obj, restore)
 
     def restore(
         self, obj: Any, reset: bool = True, classes: ClassesType | None = None
@@ -386,10 +770,17 @@ class Unpickler:
             self.reset()
         if classes:
             self.register_classes(classes)
-        value = self._restore(obj)
-        if reset:
-            self._swap_proxies()
-        return value
+        try:
+            value = self._restore(obj)
+            if reset:
+                self._swap_proxies()
+            return value
+        except BaseException:
+            # Never leak half-built objects, reference placeholders or the
+            # path/parent stacks into a subsequent decode.
+            if reset:
+                self.reset()
+            raise
 
     def register_classes(self, classes: ClassesType) -> None:
         """Register one or more classes
@@ -427,10 +818,26 @@ class Unpickler:
 
     def _restore_bytearray(self, obj: dict[str, Any]) -> bytearray:
         payload = obj[tags.BYTEARRAY]
-        if tags.B85 in payload:
-            data = self._restore_base85(payload)
-        else:
-            data = self._restore_base64(payload)
+        track = self._policy_enabled()
+        if track:
+            inner_tag = tags.B85 if tags.B85 in payload else tags.B64
+            self._push_path(inner_tag)
+        try:
+            if track:
+                # Route the nested b64/b85 node through the policy as well;
+                # a demoted inner payload is kept as-is.
+                restored = self._restore(payload)
+                if isinstance(restored, (bytes, bytearray)):
+                    data = bytes(restored)
+                else:
+                    data = b""
+            elif tags.B85 in payload:
+                data = self._restore_base85(payload)
+            else:
+                data = self._restore_base64(payload)
+        finally:
+            if track:
+                self._pop_path()
         return bytearray(data)
 
     def _refname(self) -> str:
@@ -472,7 +879,16 @@ class Unpickler:
     def _restore_list(self, obj: list[Any]) -> list[Any]:
         parent = []
         self._mkref(parent)
-        children = [self._restore(v) for v in obj]
+        track = self._policy_enabled()
+        children = []
+        for index, value in enumerate(obj):
+            if track:
+                self._push_path(index)
+            try:
+                children.append(self._restore(value))
+            finally:
+                if track:
+                    self._pop_path()
         parent.extend(children)
         method = _obj_setvalue
         proxies = [
@@ -484,10 +900,16 @@ class Unpickler:
         return parent
 
     def _restore_iterator(self, obj: dict[str, Any]) -> Iterator[Any]:
+        track = self._policy_enabled()
+        if track:
+            self._push_path(tags.ITERATOR)
         try:
             return iter(self._restore_list(obj[tags.ITERATOR]))
         except TypeError:
             return iter([])
+        finally:
+            if track:
+                self._pop_path()
 
     def _swapref(self, proxy: _Proxy, instance: Any) -> None:
         proxy_id = id(proxy)
@@ -509,7 +931,16 @@ class Unpickler:
         proxy = _Proxy()
         self._mkref(proxy)
         try:
-            reduce_val = list(map(self._restore, obj[tags.REDUCE]))
+            track = self._policy_enabled()
+            reduce_val = []
+            for index, value in enumerate(obj[tags.REDUCE]):
+                if track:
+                    self._push_path(f"{tags.REDUCE}/{index}")
+                try:
+                    reduce_val.append(self._restore(value))
+                finally:
+                    if track:
+                        self._pop_path()
         except TypeError:
             result = []
             proxy.reset(result)
@@ -619,7 +1050,14 @@ class Unpickler:
                 continue
         if default_factory is None:
             return None
-        return self._restore(default_factory)
+        track = self._policy_enabled()
+        if track:
+            self._push_path(tags.DEFAULT_FACTORY)
+        try:
+            return self._restore(default_factory)
+        finally:
+            if track:
+                self._pop_path()
 
     def _process_missing(self, class_name: str) -> None:
         # most common case comes first
@@ -688,7 +1126,14 @@ class Unpickler:
             if restore_dict_items:
                 k = restore_key(k)
                 # step into the namespace
-                value = self._restore(v)
+                track = self._policy_enabled()
+                if track:
+                    self._push_path(str_k)
+                try:
+                    value = self._restore(v)
+                finally:
+                    if track:
+                        self._pop_path()
             else:
                 value = v
             if util._is_noncomplex(instance) or util._is_dictionary_subclass(instance):
@@ -745,7 +1190,14 @@ class Unpickler:
         return instance
 
     def _restore_state(self, obj: dict[str, Any], instance: Any) -> Any:
-        state = self._restore(obj[tags.STATE])
+        track = self._policy_enabled()
+        if track:
+            self._push_path(tags.STATE)
+        try:
+            state = self._restore(obj[tags.STATE])
+        finally:
+            if track:
+                self._pop_path()
         has_slots = (
             isinstance(state, tuple) and len(state) == 2 and isinstance(state[1], dict)
         )
@@ -785,11 +1237,27 @@ class Unpickler:
         # Handle list and set subclasses
         if has_tag(obj, tags.SEQ):
             if hasattr(instance, "append"):
-                for v in obj[tags.SEQ]:
-                    instance.append(self._restore(v))
+                for seq_index, v in enumerate(obj[tags.SEQ]):
+                    track = self._policy_enabled()
+                    if track:
+                        self._push_path(f"{tags.SEQ}/{seq_index}")
+                    try:
+                        restored = self._restore(v)
+                    finally:
+                        if track:
+                            self._pop_path()
+                    instance.append(restored)
             elif hasattr(instance, "add"):
-                for v in obj[tags.SEQ]:
-                    instance.add(self._restore(v))
+                for seq_index, v in enumerate(obj[tags.SEQ]):
+                    track = self._policy_enabled()
+                    if track:
+                        self._push_path(f"{tags.SEQ}/{seq_index}")
+                    try:
+                        restored = self._restore(v)
+                    finally:
+                        if track:
+                            self._pop_path()
+                    instance.add(restored)
 
         if has_tag(obj, tags.STATE):
             instance = self._restore_state(obj, instance)
@@ -813,10 +1281,24 @@ class Unpickler:
         else:
             args = getargs(obj, classes=self._classes)
             kwargs = {}
+        track = self._policy_enabled()
         if args:
-            args = self._restore(args)
+            arg_tag = tags.NEWARGS if has_tag(obj, tags.NEWARGS) else tags.INITARGS
+            if track:
+                self._push_path(arg_tag)
+            try:
+                args = self._restore(args)
+            finally:
+                if track:
+                    self._pop_path()
         if kwargs:
-            kwargs = self._restore(kwargs)
+            if track:
+                self._push_path(tags.NEWARGSEX)
+            try:
+                kwargs = self._restore(kwargs)
+            finally:
+                if track:
+                    self._pop_path()
 
         is_oldstyle = not (isinstance(cls, type) or getattr(cls, "__meta__", None))
         try:
@@ -872,6 +1354,10 @@ class Unpickler:
 
         if cls is None:
             self._process_missing(class_name)
+            if self._policy_enabled():
+                # The declared class cannot be imported, but nested tagged
+                # children must still pass through the policy.
+                return self._restore_demoted(obj, tags.OBJECT)
             return self._mkref(obj)
 
         return self._restore_object_instance(obj, cls, class_name)
@@ -880,8 +1366,18 @@ class Unpickler:
         return util.loadclass(obj[tags.FUNCTION], classes=self._classes)
 
     def _restore_set(self, obj: dict[str, Any]) -> set[Any]:
+        track = self._policy_enabled()
         try:
-            return {self._restore(v) for v in obj[tags.SET]}
+            values = set()
+            for index, value in enumerate(obj[tags.SET]):
+                if track:
+                    self._push_path(index)
+                try:
+                    values.add(self._restore(value))
+                finally:
+                    if track:
+                        self._pop_path()
+            return values
         except TypeError:
             return set()
 
@@ -903,7 +1399,14 @@ class Unpickler:
                 else:
                     str_k = k
                 self._namestack.append(str_k)
-                data[k] = result = self._restore(v)
+                track = self._policy_enabled()
+                if track:
+                    self._push_path(str_k)
+                try:
+                    data[k] = result = self._restore(v)
+                finally:
+                    if track:
+                        self._pop_path()
                 if isinstance(result, _Proxy):
                     self._proxies.append((data, k, result, _obj_setvalue))
 
@@ -914,9 +1417,15 @@ class Unpickler:
                 if not _is_json_key(k):
                     continue
                 self._namestack.append(k)
-
-                restored_key = self._restore_pickled_key(k)
-                result = self._restore(v)
+                track = self._policy_enabled()
+                if track:
+                    self._push_path(str(k))
+                try:
+                    restored_key = self._restore_pickled_key(k)
+                    result = self._restore(v)
+                finally:
+                    if track:
+                        self._pop_path()
                 try:
                     data[restored_key] = result
                 except TypeError:  # fail gracefully
@@ -939,15 +1448,32 @@ class Unpickler:
                 else:
                     str_k = k
                 self._namestack.append(str_k)
-                data[k] = result = self._restore(v)
+                track = self._policy_enabled()
+                if track:
+                    self._push_path(str_k)
+                try:
+                    data[k] = result = self._restore(v)
+                finally:
+                    if track:
+                        self._pop_path()
                 if isinstance(result, _Proxy):
                     self._proxies.append((data, k, result, _obj_setvalue))
                 self._namestack.pop()
         return data
 
     def _restore_tuple(self, obj: dict[str, Any]) -> tuple[Any, ...]:
+        track = self._policy_enabled()
         try:
-            return tuple(self._restore(v) for v in obj[tags.TUPLE])
+            values = []
+            for index, value in enumerate(obj[tags.TUPLE]):
+                if track:
+                    self._push_path(index)
+                try:
+                    values.append(self._restore(value))
+                finally:
+                    if track:
+                        self._pop_path()
+            return tuple(values)
         except TypeError:
             return ()
 

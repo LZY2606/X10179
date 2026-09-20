@@ -1,5 +1,18 @@
 v5.0.0
 ======
+    * Added an opt-in ``restore_policy`` argument to ``decode()``/``loads()``
+      and ``Unpickler``. The policy callback is consulted for every tagged
+      JSON node *before* instantiation and receives normalized module/class
+      metadata, the registered handler, the triggering tag, the parent
+      container type and a stable JSON path. It can return ``allow``,
+      ``deny`` (raises ``jsonpickle.policy.RestoreDeniedError``) or
+      ``demote`` (restore a naive dict/list while nested values are still
+      policy-checked). An optional ``decision_trace`` records path,
+      candidate, rule, result and reason without storing input values.
+      References (including cycles, forward refs and ``make_refs=False``)
+      stay self-consistent under allow and demote, and failed decodes
+      reset all internal state. Default behavior is unchanged when no
+      policy is passed.
     * **Breaking Change**: The ``yaml`` module is no longer registered by default.
       You can re-enable yaml support using ``jsonpickle.ext.yaml.register()``.
       (#550) (+551)
